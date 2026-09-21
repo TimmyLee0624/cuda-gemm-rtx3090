@@ -1,0 +1,16 @@
+# build artifacts
+gemm
+*.o
+*.out
+
+# profiler reports (can be hundreds of MB)
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+report_*
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
