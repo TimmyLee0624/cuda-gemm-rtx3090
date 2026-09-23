@@ -33,6 +33,20 @@ static constexpr double PEAK_BW_GBPS     = 936.0;    // GDDR6X 384-bit @ 19.5 Gb
 #endif
 
 // ---------------------------------------------------------------------------
+// Tunables.  MUST be defined before any kernel that uses them -- a macro is
+// expanded at its point of use, so defining BLOCK_DIM further down the file
+// makes it invisible to everything above.
+// ---------------------------------------------------------------------------
+#ifndef BLOCK_DIM
+#define BLOCK_DIM 16   // 16x16 = 256 thr/block -> 6 blocks/SM -> 100% occupancy.
+                       // Try 32 (=1024 thr) and explain the occupancy drop.
+#endif
+
+#ifndef TILE
+#define TILE BLOCK_DIM      // one thread <-> one shared-memory element
+#endif
+
+// ---------------------------------------------------------------------------
 // Error checking
 // ---------------------------------------------------------------------------
 #define CUDA_CHECK(call)                                                       \
@@ -51,6 +65,9 @@ static constexpr double PEAK_BW_GBPS     = 936.0;    // GDDR6X 384-bit @ 19.5 Gb
         CUDA_CHECK(cudaGetLastError());                                        \
         CUDA_CHECK(cudaDeviceSynchronize());                                   \
     } while (0)
+
+// Usable from both host launchers and device code.
+__host__ __device__ static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // ===========================================================================
 //  STAGE 1 : Naive Global-Memory GEMM  (Cudabook Ch.4)
@@ -106,7 +123,59 @@ __global__ void gemm_naive_v2(const float* __restrict__ A,
 }
 
 // ===========================================================================
-//  STAGE 2 : Shared-Memory Tiling      (Cudabook Ch.5)   -- later
+//  STAGE 2 : Shared-Memory Tiling   (Cudabook Ch.5)
+//
+//  Same output-per-thread as Stage 1 (one C element), but the k-loop is
+//  blocked: each iteration stages a TILE x TILE sub-block of A and of B into
+//  shared memory, then every thread in the block reuses them TILE times.
+//
+//  Block-level AI is UNCHANGED at TILE/4 = 4 FLOP/Byte -- L1 was already
+//  giving us that. What changes is that the reuse is now GUARANTEED instead
+//  of being at the mercy of L1 eviction. Expect ~1.5-2x, not 10x.
+// ===========================================================================
+
+__global__ void gemm_tiled_v1(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* __restrict__ C,
+                              int n)
+{
+    // TODO(you): __shared__ float As[TILE][TILE], Bs[TILE][TILE];
+    __shared__ float As[TILE][TILE], Bs[TILE][TILE];
+    // TODO(you): this thread's OUTPUT coordinates (row, col) -- same mapping
+    //            as gemm_naive_v1 (row from .y, col from .x).
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float sum = 0.0f;
+    for (int t = 0; t < ceil_div(n, TILE); ++t) {
+    //     (a) cooperative load: each thread brings in exactly ONE element of A
+    //         and ONE of B.
+    //           - the A sub-block and the B sub-block travel along k in
+    //             DIFFERENT directions -- their index expressions differ.
+    //           - out of range? store 0.0f. Do NOT skip the store: a stale
+    //             value from iteration t-1 would silently corrupt the sum.
+        As[threadIdx.y][threadIdx.x] = (row < n && (t * TILE + threadIdx.x) < n) ? A[row * n + (t * TILE + threadIdx.x)] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] = (col < n && (t * TILE + threadIdx.y) < n) ? B[(t * TILE + threadIdx.y) * n + col] : 0.0f;
+    //     (b) barrier #1   (RAW: everybody wrote before anybody reads)
+        __syncthreads();
+    //     (c) for (int kk = 0; kk < TILE; ++kk) sum += As[..][..] * Bs[..][..];
+        for (int kk=0; kk<TILE; ++kk) {
+            sum += As[threadIdx.y][kk] * Bs[kk][threadIdx.x];
+        }
+    //     (d) barrier #2   (WAR: everybody read before anybody overwrites)
+        __syncthreads();
+    }
+    //
+    // TODO(you): guarded write-back  
+    if (row < n && col < n) C[row * n + col] = sum;
+    // !! TRAP !! __syncthreads() must be reached by EVERY thread of the block.
+    // Never put the k-loop inside `if (row < n && col < n) { ... }` -- the
+    // edge threads would skip the barrier and the block hangs (or worse,
+    // silently produces garbage). Guard the LOADS and the STORE, never the
+    // BARRIERS.
+}
+
+// ===========================================================================
 //  STAGE 3 : Thread-Level / Register Tiling (Ch.6)       -- later
 //  STAGE 4 : Unrolling / Vectorized LD / Double Buffer   -- later
 // ===========================================================================
@@ -114,13 +183,6 @@ __global__ void gemm_naive_v2(const float* __restrict__ A,
 // ---------------------------------------------------------------------------
 // Launch wrappers  (one per kernel, so the benchmark loop stays generic)
 // ---------------------------------------------------------------------------
-#ifndef BLOCK_DIM
-#define BLOCK_DIM 16   // 16x16 = 256 thr/block -> 6 blocks/SM -> 100% occupancy.
-                       // Try 32 (=1024 thr) and explain the occupancy drop.
-#endif
-
-static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
-
 static void launch_naive_v1(const float* A, const float* B, float* C, int n) {
     dim3 block(BLOCK_DIM, BLOCK_DIM);
     dim3 grid(ceil_div(n, BLOCK_DIM), ceil_div(n, BLOCK_DIM));
@@ -131,6 +193,12 @@ static void launch_naive_v2(const float* A, const float* B, float* C, int n) {
     dim3 block(BLOCK_DIM, BLOCK_DIM);
     dim3 grid(ceil_div(n, BLOCK_DIM), ceil_div(n, BLOCK_DIM));
     gemm_naive_v2<<<grid, block>>>(A, B, C, n);
+}
+
+static void launch_tiled_v1(const float* A, const float* B, float* C, int n) {
+    dim3 block(TILE, TILE);
+    dim3 grid(ceil_div(n, TILE), ceil_div(n, TILE));
+    gemm_tiled_v1<<<grid, block>>>(A, B, C, n);
 }
 
 #ifdef USE_CUBLAS
@@ -152,6 +220,7 @@ struct KernelEntry {
 static const KernelEntry g_kernels[] = {
     { "1. naive  (row=y, col=x)  [coalesced]",   launch_naive_v1 },
     { "2. naive  (row=x, col=y)  [strided]",     launch_naive_v2 },
+    { "3. tiled  (shared memory)",               launch_tiled_v1 },
 #ifdef USE_CUBLAS
     { "0. cuBLAS SGEMM           [reference]",   launch_cublas   },
 #endif
