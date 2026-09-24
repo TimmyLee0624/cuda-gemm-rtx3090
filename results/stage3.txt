@@ -1,0 +1,19 @@
+nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo -Xcompiler "-O3 -march=native -fopenmp" -o gemm gemm.cu -Xcompiler "-fopenmp"
+./gemm 4096 
+================================================================
+  GPU      : NVIDIA GeForce RTX 3090  (sm_86, 82 SMs)
+  Problem  : C[4096 x 4096] = A * B   (FP32, row-major)
+  Workload : 137.44 GFLOP,  64.0 MB/matrix
+  Roofline : peak 35.6 TFLOP/s | DRAM 936 GB/s | ridge 38 FLOP/B
+================================================================
+
+[CPU] N=4096 > 1024, skipping verification (perf mode).
+
+kernel                                       time(ms)      GFLOP/s    %peak
+----------------------------------------------------------------------------
+1. naive  (row=y, col=x)  [coalesced]          60.219       2282.3    6.41%
+2. naive  (row=x, col=y)  [strided]           229.789        598.1    1.68%
+3. tiled  (shared memory)                      45.239       3038.1    8.53%
+4. regtile (128x128 blk, 8x8/thread)           10.302      13340.4   37.47%
+----------------------------------------------------------------------------
+  best: 13340.4 GFLOP/s  (37.47% of peak, 57.01x the 234 GFLOP/s naive-DRAM bound)

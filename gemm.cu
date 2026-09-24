@@ -176,8 +176,114 @@ __global__ void gemm_tiled_v1(const float* __restrict__ A,
 }
 
 // ===========================================================================
-//  STAGE 3 : Thread-Level / Register Tiling (Ch.6)       -- later
-//  STAGE 4 : Unrolling / Vectorized LD / Double Buffer   -- later
+//  STAGE 3 : Thread-Level (Register) Tiling   (Cudabook Ch.6)
+//
+//  Stage 2 hit a shared-memory wall: 2 LDS per FFMA caps the kernel at
+//  17.8 TB/s * 0.25 FLOP/B = 4.45 TFLOP/s no matter how good the DRAM side is.
+//
+//  Fix: give each thread a TM x TN micro-tile of C held entirely in registers.
+//  Per k-step a thread now loads TM + TN floats from smem and issues TM * TN
+//  FFMAs, so the ratio goes from 0.5 to (TM*TN)/(TM+TN) = 4 at 8x8, which
+//  lifts the shared-memory ceiling to ~35.6 TFLOP/s = FP32 peak.
+//
+//  Block computes BM x BN of C, marching over k in chunks of BK.
+//    threads/block = (BM/TM) * (BN/TN) = 16 * 16 = 256
+//    smem          = (BM*BK + BK*BN) * 4 B = 8 KB  (of 100 KB/SM)
+//    A-loads/thread per k-chunk = BM*BK / 256 = 4   (same for B)
+// ===========================================================================
+
+#ifndef BM
+#define BM 128      // block tile rows    (C)
+#define BN 128      // block tile cols    (C)
+#define BK 8        // k-chunk depth
+#define TM 8        // per-thread micro-tile rows
+#define TN 8        // per-thread micro-tile cols
+#endif
+#define THREADS_PER_BLOCK ((BM / TM) * (BN / TN))   // 256
+
+__global__ void gemm_regtile_v1(const float* __restrict__ A,
+                                const float* __restrict__ B,
+                                float* __restrict__ C,
+                                int n)
+{
+    // Launched with a 1-D block of THREADS_PER_BLOCK threads.
+    //
+    // TODO(you): __shared__ float As[...], Bs[BK][BN];
+    //     DESIGN QUESTION -- should As be [BM][BK] or [BK][BM]?
+    //     In the inner loop every thread reads a COLUMN of the A-tile
+    //     (fixed k, TM different rows). Which layout makes that a
+    //     contiguous, bank-conflict-free read? Decide before you write it.
+    __shared__ float As[BM][BK], Bs[BK][BN];
+    // TODO(you): this thread's position inside the 16x16 grid of micro-tiles:
+    const int tRow = threadIdx.x / (BN / TN);
+    const int tCol = threadIdx.x % (BN / TN);
+    //     -> this thread owns C rows [blockIdx.y*BM + tRow*TM, +TM)
+    //                       C cols [blockIdx.x*BN + tCol*TN, +TN)
+    //
+    // TODO(you): float acc[TM][TN] = {0.0f};        // MUST stay in registers
+    //            float regA[TM], regB[TN];
+    float acc[TM][TN] = {0.0f};
+    float regA[TM], regB[TN];
+    for (int k0 = 0; k0 < n; k0 += BK) {
+    //   (a) cooperative load of A[.. , k0..k0+BK) and B[k0..k0+BK, ..] into
+    //       smem. 256 threads, 1024 elements each -> 4 elements per thread.
+    //       Derive a SEPARATE (row, col) mapping for loading; it has nothing
+    //       to do with tRow/tCol. Keep global reads coalesced. Zero-fill OOB.
+        for (int i=0; i<4; ++i) {
+            int idx = threadIdx.x + i * 256;
+            int row_a = idx / BK;
+            int col_a = idx % BK;
+            int global_row_a = blockIdx.y * BM + row_a;
+            int global_col_a = k0 + col_a;
+            As[row_a][col_a] = (global_row_a < n && global_col_a < n) ? A[global_row_a * n + global_col_a] : 0.0f;
+            int row_b = idx / BN;
+            int col_b = idx % BN;
+            int global_row_b = k0 + row_b;
+            int global_col_b = blockIdx.x * BN + col_b;
+            Bs[row_b][col_b] = (global_row_b < n && global_col_b < n) ? B[global_row_b * n + global_col_b] : 0.0f;
+        }
+    //   (b) __syncthreads();                         // RAW
+        __syncthreads();
+    //   (c) #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+    //           #pragma unroll
+            for (int i=0; i<TM; ++i) { // TM smem loads
+                regA[i] = As[tRow * TM + i][kk];
+            }        
+    //           #pragma unroll
+            for (int j=0; j<TN; ++j) { // TN smem loads
+                regB[j] = Bs[kk][tCol * TN + j];
+            }
+    //           #pragma unroll
+            for (int i=0; i<TM; ++i) {
+    //             #pragma unroll
+                for (int j=0; j<TN; ++j) { // TM*TN FFMA
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+    //
+    //   (d) __syncthreads();                         // WAR
+        __syncthreads();
+    }
+    //
+    // TODO(you): write back acc[i][j] with bounds guards.
+    for (int i=0; i<TM; ++i) {
+        for (int j=0; j<TN; ++j) {
+            int global_row = blockIdx.y * BM + tRow * TM + i;
+            int global_col = blockIdx.x * BN + tCol * TN + j; 
+            if (global_row < n && global_col < n) {
+                C[global_row * n + global_col] = acc[i][j];
+            }
+        }
+    }   
+    // !! CHECK `make resource` !! Every #pragma unroll above is load-bearing.
+    // If ptxas reports ANY "bytes lmem" or "spill", acc[][] fell out of the
+    // register file into DRAM and the whole design is void.
+}
+
+// ===========================================================================
+//  STAGE 4 : Vectorized LD (float4) / Double Buffering / Bank-conflict fixes
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -201,6 +307,12 @@ static void launch_tiled_v1(const float* A, const float* B, float* C, int n) {
     gemm_tiled_v1<<<grid, block>>>(A, B, C, n);
 }
 
+static void launch_regtile_v1(const float* A, const float* B, float* C, int n) {
+    dim3 block(THREADS_PER_BLOCK);
+    dim3 grid(ceil_div(n, BN), ceil_div(n, BM));
+    gemm_regtile_v1<<<grid, block>>>(A, B, C, n);
+}
+
 #ifdef USE_CUBLAS
 static cublasHandle_t g_cublas = nullptr;
 static void launch_cublas(const float* A, const float* B, float* C, int n) {
@@ -221,6 +333,7 @@ static const KernelEntry g_kernels[] = {
     { "1. naive  (row=y, col=x)  [coalesced]",   launch_naive_v1 },
     { "2. naive  (row=x, col=y)  [strided]",     launch_naive_v2 },
     { "3. tiled  (shared memory)",               launch_tiled_v1 },
+    { "4. regtile (128x128 blk, 8x8/thread)",    launch_regtile_v1 },
 #ifdef USE_CUBLAS
     { "0. cuBLAS SGEMM           [reference]",   launch_cublas   },
 #endif
