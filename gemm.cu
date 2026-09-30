@@ -283,7 +283,181 @@ __global__ void gemm_regtile_v1(const float* __restrict__ A,
 }
 
 // ===========================================================================
-//  STAGE 4 : Vectorized LD (float4) / Double Buffering / Bank-conflict fixes
+//  STAGE 4a : Transposed As + vectorized shared loads
+//
+//  ncu on gemm_regtile_v1 (N=2048):
+//      shared-ld instructions   41,943,040
+//      wavefronts              134,218,687   -> 3.20 per instruction
+//      bank conflicts           67,108,864   -> exactly 2.00x oversubscribed
+//      DRAM throughput                5.2%   -> DRAM is NOT the problem
+//
+//  Per warp per kk the LDS pipe needs 32 wavefronts while the FFMA pipe needs
+//  only 16 cycles, so the kernel is capped at 35.6 * 16/32 = 17.8 TFLOP/s.
+//
+//  v1 stored As as [BM][BK], which makes regA[i] = As[tRow*TM+i][kk] stride by
+//  BK -- the compiler cannot vectorize it (it DID vectorize regB, which is why
+//  we measured 10 LDS/kk instead of 16), and the two tRow values in a warp
+//  land 64 words apart == same bank == 2-way conflict.
+//
+//  Goal here: regA 16 -> 8 wavefronts, lifting the ceiling to ~23.7 TFLOP/s.
+//  Keep gemm_regtile_v1 untouched so both run side by side.
+// ===========================================================================
+
+// TODO(you): pick the pad.  A transposed STORE writes As[k][row] for 4
+// consecutive k, i.e. addresses stride by the row pitch. With pitch = BM = 128
+// words, 128 % 32 == 0, so every k lands in the SAME bank -- and across a warp
+// the two halves collide 2-way while banks 16..31 sit idle.
+// Padding the pitch breaks that alignment. Work out on paper which pad value
+// makes BOTH of these conflict-free, then set it:
+//   (i)  the transposed store   As[k0_local + c][row]
+//   (ii) the vectorized read    As[kk][tRow*TM + i], i = 0..TM-1
+#ifndef AS_PAD
+#define AS_PAD 4        // <-- 0 is deliberately wrong. Derive the right value.
+#endif
+
+__global__ void gemm_vec_v1(const float* __restrict__ A,
+                            const float* __restrict__ B,
+                            float* __restrict__ C,
+                            int n)
+{
+    // TODO(you): __shared__ float As[BK][BM + AS_PAD];   // TRANSPOSED
+    //            __shared__ float Bs[BK][BN];            // unchanged
+    __shared__ float As[BK][BM + AS_PAD], Bs[BK][BN];
+    // TODO(you): same tRow / tCol micro-tile mapping as v1.
+    const int tRow = threadIdx.x / (BN / TN);
+    const int tCol = threadIdx.x % (BN / TN);
+    const int tid = threadIdx.x;
+
+    float acc[TM][TN] = {0.0f};
+    float regA[TM], regB[TN];
+    for (int k0 = 0; k0 < n; k0 += BK) {
+    // ---- (a) global -> shared, now with float4 ----------------------------
+    // The A tile is BM*BK = 128*8 = 1024 floats = 256 float4s, and there are
+    // exactly 256 threads, so each thread moves ONE float4 (was: 4 scalars in
+    // a loop). Same for B.
+    //   TODO: derive the float4 mapping for A. Each row of the A tile is BK=8
+    //         floats = 2 float4s, so 128 rows * 2 = 256. Which (row, half)
+    //         does thread tid own?
+    //   TODO: the A store is TRANSPOSED -- one float4 read becomes 4 scalar
+    //         stores As[k+0..3][row]. There is no way around the scatter; the
+    //         pad is what keeps it conflict-free.
+    //   TODO: B needs no transpose, so its float4 can be stored as a float4.
+    //   TODO: alignment. reinterpret_cast<const float4*> requires the address
+    //         to be 16-byte aligned, which needs n % 4 == 0. Guard it: fall
+    //         back to the scalar path (or just bail to v1) otherwise, and
+    //         still zero-fill out-of-range elements.
+        if (n % 4 == 0) {
+            int row_a = tid / 2;
+            int vec_a = tid % 2;
+            int global_row_a = blockIdx.y * BM + row_a;
+            int global_col_a = k0 + vec_a * 4;
+            
+            float4 val_a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_a < n && global_col_a + 3 < n) {
+                val_a = *reinterpret_cast<const float4*>(&A[global_row_a * n + global_col_a]);
+            }
+            else if (global_row_a < n) {
+                if (global_col_a + 0 < n) val_a.x = A[global_row_a * n + global_col_a + 0];
+                if (global_col_a + 1 < n) val_a.y = A[global_row_a * n + global_col_a + 1];
+                if (global_col_a + 2 < n) val_a.z = A[global_row_a * n + global_col_a + 2];
+                if (global_col_a + 3 < n) val_a.w = A[global_row_a * n + global_col_a + 3];
+            }
+
+            int smem_col_a = row_a;
+            int smem_row_a_base = vec_a * 4;
+            As[smem_row_a_base + 0][smem_col_a] = val_a.x;
+            As[smem_row_a_base + 1][smem_col_a] = val_a.y;
+            As[smem_row_a_base + 2][smem_col_a] = val_a.z;
+            As[smem_row_a_base + 3][smem_col_a] = val_a.w;
+
+            // 2. 載入 B 並直接寫入 Bs
+            int row_b = tid / 32;
+            int col_b_vec = tid % 32;
+            int global_row_b = k0 + row_b;
+            int global_col_b = blockIdx.x * BN + col_b_vec * 4;
+
+            float4 val_b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_b < n && global_col_b + 3 < n) {
+                val_b = *reinterpret_cast<const float4*>(&B[global_row_b * n + global_col_b]);
+            }
+            else if (global_row_b < n) {
+                if (global_col_b + 0 < n) val_b.x = B[global_row_b * n + global_col_b + 0];
+                if (global_col_b + 1 < n) val_b.y = B[global_row_b * n + global_col_b + 1];
+                if (global_col_b + 2 < n) val_b.z = B[global_row_b * n + global_col_b + 2];
+                if (global_col_b + 3 < n) val_b.w = B[global_row_b * n + global_col_b + 3];
+            }
+
+            reinterpret_cast<float4*>(&Bs[row_b][col_b_vec * 4])[0] = val_b;
+        }
+        else {
+            for (int i=0; i<4; ++i) {
+                // ---- (a) global -> shared (暫時保留 scalar 確保正確，或後續改 float4) ----
+                int idx = threadIdx.x + i * 256;
+                int row_a = idx / BK;
+                int col_a = idx % BK;
+                int global_row_a = blockIdx.y * BM + row_a;
+                int global_col_a = k0 + col_a;
+                // 注意這裡：As 是 [BK][BM + AS_PAD]，所以寫入時要轉置為 [col_a][row_a]
+                As[col_a][row_a] = (global_row_a < n && global_col_a < n) ? A[global_row_a * n + global_col_a] : 0.0f;
+                int row_b = idx / BN;
+                int col_b = idx % BN;
+                int global_row_b = k0 + row_b;
+                int global_col_b = blockIdx.x * BN + col_b;
+                Bs[row_b][col_b] = (global_row_b < n && global_col_b < n) ? B[global_row_b * n + global_col_b] : 0.0f;
+            }
+        }
+    // ---- (b) __syncthreads() ----------------------------------------------
+        __syncthreads();
+    // ---- (c) inner loop ---------------------------------------------------
+    //   #pragma unroll  on EVERY loop below -- write them out this time, v1
+    //   only worked because nvcc happened to auto-unroll at -O3.
+    //     for (kk < BK) {
+    //         regA[0..TM) <- As[kk][tRow*TM ..]    // now contiguous -> float4
+    //         regB[0..TN) <- Bs[kk][tCol*TN ..]    // already float4 in v1
+    //         TM*TN FFMAs into acc[][]
+    //     }
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int i=0; i<TM; ++i) { // TM smem loads
+                regA[i] = As[kk][tRow * TM + i]; // 讀取轉置後的 As
+            }        
+            #pragma unroll
+            for (int j=0; j<TN; ++j) { // TN smem loads
+                regB[j] = Bs[kk][tCol * TN + j];
+            }
+            #pragma unroll
+            for (int i=0; i<TM; ++i) {
+                #pragma unroll
+                for (int j=0; j<TN; ++j) { // TM*TN FFMA
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+    // ---- (d) __syncthreads() ----------------------------------------------
+        __syncthreads();
+    }
+    // ---- write back -------------------------------------------------------
+    //   acc[i][0..TN) is contiguous in C -> 2 float4 stores per row of the
+    //   micro-tile, when alignment and bounds allow.
+    for (int i=0; i<TM; ++i) {
+        for (int j=0; j<TN; ++j) {
+            int global_row = blockIdx.y * BM + tRow * TM + i;
+            int global_col = blockIdx.x * BN + tCol * TN + j; 
+            if (global_row < n && global_col < n) {
+                C[global_row * n + global_col] = acc[i][j];
+            }
+        }
+    }   
+    // CHECKLIST, in this order -- do not skip ahead to GFLOP/s:
+    //   1. make resource            -> spill MUST still be 0
+    //   2. make run N=1024          -> [PASS]
+    //   3. make run N=1000          -> [PASS]  (odd n, exercises the fallback)
+    //   4. make bank KERNEL=gemm_vec_v1  -> wavefronts/inst should drop 3.20 -> ~2.4
+    //   5. make run N=4096          -> only now look at throughput
+}
+
+// ===========================================================================
+//  STAGE 4b : regB conflict fix / double buffering   -- after 4a is measured
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -313,6 +487,12 @@ static void launch_regtile_v1(const float* A, const float* B, float* C, int n) {
     gemm_regtile_v1<<<grid, block>>>(A, B, C, n);
 }
 
+static void launch_vec_v1(const float* A, const float* B, float* C, int n) {
+    dim3 block(THREADS_PER_BLOCK);
+    dim3 grid(ceil_div(n, BN), ceil_div(n, BM));
+    gemm_vec_v1<<<grid, block>>>(A, B, C, n);
+}
+
 #ifdef USE_CUBLAS
 static cublasHandle_t g_cublas = nullptr;
 static void launch_cublas(const float* A, const float* B, float* C, int n) {
@@ -334,6 +514,7 @@ static const KernelEntry g_kernels[] = {
     { "2. naive  (row=x, col=y)  [strided]",     launch_naive_v2 },
     { "3. tiled  (shared memory)",               launch_tiled_v1 },
     { "4. regtile (128x128 blk, 8x8/thread)",    launch_regtile_v1 },
+    { "5. vec     (As^T + float4 smem loads)",   launch_vec_v1     },
 #ifdef USE_CUBLAS
     { "0. cuBLAS SGEMM           [reference]",   launch_cublas   },
 #endif
