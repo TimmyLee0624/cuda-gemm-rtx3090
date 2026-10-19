@@ -240,9 +240,13 @@ the kk+1 loads' latency.
 ## Repository layout
 
 ```
-gemm.cu      all six kernels, CPU reference, verification, timing harness
+gemm.cu      all seven kernels, CPU reference, verification, timing harness
 Makefile     build, resource report, bank-conflict profiling
 results/     raw benchmark output per stage
 ```
 
-Each stage is tagged: `git checkout stage1` … `stage4c`.
+Every run prints the whole ladder, one row per stage, so the progression is
+visible without checking anything out. Stages are also tagged —
+`git checkout stage1` … `stage4c` — with one gap: **4b and 4c landed in a
+single commit** (`cd03087`), so no commit holds 4b on its own and there is no
+`stage4b` tag. `results/stage4b.txt` has its isolated numbers instead.

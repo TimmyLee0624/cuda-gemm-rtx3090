@@ -1,0 +1,35 @@
+# Stage 4b (gemm_vec_v2) isolated benchmark
+# NOTE: 4b's code shipped in commit cd03087 together with 4c; there is no
+#       commit containing 4b alone, so there is no stage4b tag.
+
+================================================================
+  GPU      : NVIDIA GeForce RTX 3090  (sm_86, 82 SMs)
+  Problem  : C[4096 x 4096] = A * B   (FP32, row-major)
+  Workload : 137.44 GFLOP,  64.0 MB/matrix
+  Roofline : peak 35.6 TFLOP/s | DRAM 936 GB/s | ridge 38 FLOP/B
+================================================================
+
+[CPU] N=4096 > 1024, skipping verification (perf mode).
+
+kernel                                       time(ms)      GFLOP/s    %peak
+----------------------------------------------------------------------------
+6. vec2    (+ split regB, no conflicts)         8.530      16112.6   45.26%
+----------------------------------------------------------------------------
+  best: 16112.6 GFLOP/s  (45.26% of peak, 68.86x the 234 GFLOP/s naive-DRAM bound)
+
+================================================================
+  GPU      : NVIDIA GeForce RTX 3090  (sm_86, 82 SMs)
+  Problem  : C[1024 x 1024] = A * B   (FP32, row-major)
+  Workload : 2.15 GFLOP,  4.0 MB/matrix
+  Roofline : peak 35.6 TFLOP/s | DRAM 936 GB/s | ridge 38 FLOP/B
+================================================================
+
+[CPU] computing golden reference (N=1024)...
+[CPU] done.
+
+kernel                                       time(ms)      GFLOP/s    %peak
+----------------------------------------------------------------------------
+6. vec2    (+ split regB, no conflicts)         0.266       8066.4   22.66%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+----------------------------------------------------------------------------
+  best: 8066.4 GFLOP/s  (22.66% of peak, 34.47x the 234 GFLOP/s naive-DRAM bound)
