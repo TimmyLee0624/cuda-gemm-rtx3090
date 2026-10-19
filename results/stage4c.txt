@@ -1,0 +1,51 @@
+================================================================
+  GPU      : NVIDIA GeForce RTX 3090  (sm_86, 82 SMs)
+  Problem  : C[4096 x 4096] = A * B   (FP32, row-major)
+  Workload : 137.44 GFLOP,  64.0 MB/matrix
+  Roofline : peak 35.6 TFLOP/s | DRAM 936 GB/s | ridge 38 FLOP/B
+================================================================
+
+[CPU] N=4096 > 1024, skipping verification (perf mode).
+
+kernel                                       time(ms)      GFLOP/s    %peak
+----------------------------------------------------------------------------
+1. naive  (row=y, col=x)  [coalesced]          60.598       2268.0    6.37%
+2. naive  (row=x, col=y)  [strided]           231.073        594.8    1.67%
+3. tiled  (shared memory)                      45.684       3008.5    8.45%
+4. regtile (128x128 blk, 8x8/thread)           10.344      13287.0   37.32%
+5. vec     (As^T + float4 smem loads)           8.520      16131.9   45.31%
+6. vec2    (+ split regB, no conflicts)         8.345      16469.2   46.26%
+7. db      (+ register double buffering)        7.088      19390.1   54.47%
+0. cuBLAS SGEMM           [reference]           5.282      26022.3   73.10%
+----------------------------------------------------------------------------
+  best: 26022.3 GFLOP/s  (73.10% of peak, 111.21x the 234 GFLOP/s naive-DRAM bound)
+================================================================
+  GPU      : NVIDIA GeForce RTX 3090  (sm_86, 82 SMs)
+  Problem  : C[1024 x 1024] = A * B   (FP32, row-major)
+  Workload : 2.15 GFLOP,  4.0 MB/matrix
+  Roofline : peak 35.6 TFLOP/s | DRAM 936 GB/s | ridge 38 FLOP/B
+================================================================
+
+[CPU] computing golden reference (N=1024)...
+[CPU] done.
+
+kernel                                       time(ms)      GFLOP/s    %peak
+----------------------------------------------------------------------------
+1. naive  (row=y, col=x)  [coalesced]           0.971       2211.3    6.21%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+2. naive  (row=x, col=y)  [strided]             4.091        524.9    1.47%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+3. tiled  (shared memory)                       0.752       2857.2    8.03%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+4. regtile (128x128 blk, 8x8/thread)            0.289       7436.7   20.89%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+5. vec     (As^T + float4 smem loads)           0.290       7400.0   20.79%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+6. vec2    (+ split regB, no conflicts)         0.267       8029.1   22.55%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+7. db      (+ register double buffering)        0.226       9509.3   26.71%
+      verify : max_abs=2.006e-05  normwise_rel=1.511e-06  backward=0.66  [PASS]
+0. cuBLAS SGEMM           [reference]           0.114      18761.2   52.70%
+      verify : max_abs=4.985e-06  normwise_rel=3.756e-07  backward=0.16  [PASS]
+----------------------------------------------------------------------------
+  best: 18761.2 GFLOP/s  (52.70% of peak, 80.18x the 234 GFLOP/s naive-DRAM bound)

@@ -192,11 +192,22 @@ __global__ void gemm_tiled_v1(const float* __restrict__ A,
 //    A-loads/thread per k-chunk = BM*BK / 256 = 4   (same for B)
 // ===========================================================================
 
+// Individually overridable, e.g. nvcc -DBK=16. Note the cooperative-load
+// mapping in the kernels assumes BM*BK == BK*BN == 4 * THREADS_PER_BLOCK,
+// so changing BK means reworking the load index derivation too.
 #ifndef BM
 #define BM 128      // block tile rows    (C)
+#endif
+#ifndef BN
 #define BN 128      // block tile cols    (C)
+#endif
+#ifndef BK
 #define BK 8        // k-chunk depth
+#endif
+#ifndef TM
 #define TM 8        // per-thread micro-tile rows
+#endif
+#ifndef TN
 #define TN 8        // per-thread micro-tile cols
 #endif
 #define THREADS_PER_BLOCK ((BM / TM) * (BN / TN))   // 256
@@ -457,7 +468,354 @@ __global__ void gemm_vec_v1(const float* __restrict__ A,
 }
 
 // ===========================================================================
-//  STAGE 4b : regB conflict fix / double buffering   -- after 4a is measured
+//  STAGE 4b : split the B micro-tile to kill regB's bank conflict
+//
+//  ncu on gemm_vec_v1 (N=2048, AS_PAD=4):
+//      shared-ld instructions   16,777,216   (4 per warp per kk)
+//      wavefronts               83,886,846   (20.0 per warp per kk)
+//      bank conflicts           33,554,432   -- ALL of it is regB
+//
+//  Wavefront budget per warp per kk:
+//      regA  2 x LDS.128 @ 2 (broadcast: threads 0-15 share an address) =  4
+//      regB  2 x LDS.128 @ 8 (2-way conflict)                          = 16
+//                                                                  total 20
+//  against an FFMA demand of 64 inst / 4 per cycle = 16 cycles. LDS still wins.
+//
+//  WHY regB collides: an LDS.128 is served 8 threads per cycle (8 x 16 B =
+//  128 B). In one such phase tCol runs 0..7, so the word offsets are
+//  tCol*8 = 0, 8, 16, 24, 32, 40, 48, 56. Each thread claims 4 consecutive
+//  banks, so tCol=0 takes banks 0-3 and tCol=4 takes banks (32 mod 32)=0-3
+//  as well -- different addresses, same banks, 2-way conflict.
+//
+//  FIX: make one phase cover 32 CONSECUTIVE words instead of spanning 64.
+//  Each thread still owns TN=8 columns, but they come from two halves of BN:
+//        regB[0..3] <- Bs[kk][tCol*4]
+//        regB[4..7] <- Bs[kk][BN/2 + tCol*4]
+//  Now a phase reads words 0,4,8,...,28 -> all 32 banks exactly once.
+//
+//  Expected: regB 16 -> 8 wavefronts, total 20 -> 12, which drops BELOW the
+//  FFMA demand of 16. The LDS pipe stops being the limiter for the first time
+//  in this project.
+// ===========================================================================
+
+__global__ void gemm_vec_v2(const float* __restrict__ A,
+                            const float* __restrict__ B,
+                            float* __restrict__ C,
+                            int n)
+{
+    // Copied verbatim from gemm_vec_v1. Everything below is unchanged except
+    // the two blocks marked "TODO(you) 4b" -- the regB load and the write-back.
+    __shared__ float As[BK][BM + AS_PAD], Bs[BK][BN];
+    const int tRow = threadIdx.x / (BN / TN);
+    const int tCol = threadIdx.x % (BN / TN);
+    const int tid = threadIdx.x;
+
+    float acc[TM][TN] = {0.0f};
+    float regA[TM], regB[TN];
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        if (n % 4 == 0) {
+            int row_a = tid / 2;
+            int vec_a = tid % 2;
+            int global_row_a = blockIdx.y * BM + row_a;
+            int global_col_a = k0 + vec_a * 4;
+
+            float4 val_a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_a < n && global_col_a + 3 < n) {
+                val_a = *reinterpret_cast<const float4*>(&A[global_row_a * n + global_col_a]);
+            }
+            else if (global_row_a < n) {
+                if (global_col_a + 0 < n) val_a.x = A[global_row_a * n + global_col_a + 0];
+                if (global_col_a + 1 < n) val_a.y = A[global_row_a * n + global_col_a + 1];
+                if (global_col_a + 2 < n) val_a.z = A[global_row_a * n + global_col_a + 2];
+                if (global_col_a + 3 < n) val_a.w = A[global_row_a * n + global_col_a + 3];
+            }
+
+            int smem_col_a = row_a;
+            int smem_row_a_base = vec_a * 4;
+            As[smem_row_a_base + 0][smem_col_a] = val_a.x;
+            As[smem_row_a_base + 1][smem_col_a] = val_a.y;
+            As[smem_row_a_base + 2][smem_col_a] = val_a.z;
+            As[smem_row_a_base + 3][smem_col_a] = val_a.w;
+
+            int row_b = tid / 32;
+            int col_b_vec = tid % 32;
+            int global_row_b = k0 + row_b;
+            int global_col_b = blockIdx.x * BN + col_b_vec * 4;
+
+            float4 val_b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_b < n && global_col_b + 3 < n) {
+                val_b = *reinterpret_cast<const float4*>(&B[global_row_b * n + global_col_b]);
+            }
+            else if (global_row_b < n) {
+                if (global_col_b + 0 < n) val_b.x = B[global_row_b * n + global_col_b + 0];
+                if (global_col_b + 1 < n) val_b.y = B[global_row_b * n + global_col_b + 1];
+                if (global_col_b + 2 < n) val_b.z = B[global_row_b * n + global_col_b + 2];
+                if (global_col_b + 3 < n) val_b.w = B[global_row_b * n + global_col_b + 3];
+            }
+
+            reinterpret_cast<float4*>(&Bs[row_b][col_b_vec * 4])[0] = val_b;
+        }
+        else {
+            for (int i=0; i<4; ++i) {
+                int idx = threadIdx.x + i * 256;
+                int row_a = idx / BK;
+                int col_a = idx % BK;
+                int global_row_a = blockIdx.y * BM + row_a;
+                int global_col_a = k0 + col_a;
+                As[col_a][row_a] = (global_row_a < n && global_col_a < n) ? A[global_row_a * n + global_col_a] : 0.0f;
+                int row_b = idx / BN;
+                int col_b = idx % BN;
+                int global_row_b = k0 + row_b;
+                int global_col_b = blockIdx.x * BN + col_b;
+                Bs[row_b][col_b] = (global_row_b < n && global_col_b < n) ? B[global_row_b * n + global_col_b] : 0.0f;
+            }
+        }
+        __syncthreads();
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int i=0; i<TM; ++i) { // TM smem loads
+                regA[i] = As[kk][tRow * TM + i]; // 讀取轉置後的 As
+            }
+
+            // ================= TODO(you) 4b : CHANGE #1 =================
+            // v1 read 8 contiguous columns starting at tCol*TN, which makes an
+            // LDS.128 phase span 64 words and collide 2-way.
+            // Split it into two halves of BN so a phase covers 32 consecutive
+            // words:   regB[0..3] <- Bs[kk][tCol*4]
+            //          regB[4..7] <- Bs[kk][BN/2 + tCol*4]
+            #pragma unroll
+            for (int j=0; j<4; ++j) { // TN smem loads
+                regB[j] = Bs[kk][tCol * 4 + j];        // <-- replace this
+                regB[j + 4] = Bs[kk][BN / 2 + tCol * 4 + j];
+            }
+            // ============================================================
+
+            #pragma unroll
+            for (int i=0; i<TM; ++i) {
+                #pragma unroll
+                for (int j=0; j<TN; ++j) { // TM*TN FFMA
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ==================== TODO(you) 4b : CHANGE #2 ====================
+    // acc[i][j] no longer maps to 8 contiguous columns of C. Derive the new
+    // column for each j and make this agree with CHANGE #1:
+    //     j = 0..3  ->  blockIdx.x*BN + ?
+    //     j = 4..7  ->  blockIdx.x*BN + ?
+    // Leaving v1's mapping here compiles, runs, reports a plausible GFLOP/s,
+    // and is WRONG. Check N=1024 and N=1000 before looking at throughput.
+    for (int i=0; i<TM; ++i) {
+        for (int j=0; j<TN; ++j) {
+            int global_row = blockIdx.y * BM + tRow * TM + i;
+            int global_col = (j < 4) ? blockIdx.x * BN + tCol * 4 + j : blockIdx.x * BN + BN / 2 + tCol * 4 + (j - 4);   // <-- fix this
+            if (global_row < n && global_col < n) {
+                C[global_row * n + global_col] = acc[i][j];
+            }
+        }
+    }
+    // ==================================================================
+}
+
+// ===========================================================================
+//  STAGE 4c : register-level double buffering (software pipelining)
+//
+//  ncu on gemm_vec_v2 (N=2048) -- bank conflicts are gone, so what is left:
+//      shared-ld bank conflicts            0
+//      shared-st bank conflicts            0
+//      wavefronts/warp/kk               12.0   (LDS 12 < FFMA 16: not the cap)
+//      sm__pipe_fma_cycles_active      52.84%  <- the FMA pipe idles half the time
+//      DRAM throughput                  4.97%
+//    warp issue stalls (% of warp-active cycles):
+//      not_selected                    25.75%  <- healthy: spare warps exist
+//      short_scoreboard                18.87%  <- waiting on shared memory
+//      long_scoreboard                 16.65%  <- waiting on global memory
+//      barrier                          6.72%
+//
+//  The bus is idle AND warps are waiting: this is a LATENCY problem, not a
+//  bandwidth one. Prefetching the kk+1 fragments while the kk FFMAs run lets
+//  the FFMAs cover the shared-memory latency.
+//
+//  Scope: this kernel only pipelines the smem->register hop (short_scoreboard).
+//  The global->smem hop (long_scoreboard + barrier) needs a ping-pong smem
+//  buffer and a reordered k-loop; that is left as future work.
+//
+//  Realistic expectation: 10-20%, i.e. ~18-19 TFLOP/s. Speedup estimates in
+//  this project have run optimistic twice (Stage 2 and Stage 4b), so do not
+//  budget for more.
+// ===========================================================================
+
+__global__ void gemm_db_v1(const float* __restrict__ A,
+                            const float* __restrict__ B,
+                            float* __restrict__ C,
+                            int n)
+{
+    // Copied verbatim from gemm_vec_v2 (Stage 4b, zero bank conflicts).
+    __shared__ float As[BK][BM + AS_PAD], Bs[BK][BN];
+    const int tRow = threadIdx.x / (BN / TN);
+    const int tCol = threadIdx.x % (BN / TN);
+    const int tid = threadIdx.x;
+
+    float acc[TM][TN] = {0.0f};
+    // float regA[TM], regB[TN];
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        if (n % 4 == 0) {
+            int row_a = tid / 2;
+            int vec_a = tid % 2;
+            int global_row_a = blockIdx.y * BM + row_a;
+            int global_col_a = k0 + vec_a * 4;
+
+            float4 val_a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_a < n && global_col_a + 3 < n) {
+                val_a = *reinterpret_cast<const float4*>(&A[global_row_a * n + global_col_a]);
+            }
+            else if (global_row_a < n) {
+                if (global_col_a + 0 < n) val_a.x = A[global_row_a * n + global_col_a + 0];
+                if (global_col_a + 1 < n) val_a.y = A[global_row_a * n + global_col_a + 1];
+                if (global_col_a + 2 < n) val_a.z = A[global_row_a * n + global_col_a + 2];
+                if (global_col_a + 3 < n) val_a.w = A[global_row_a * n + global_col_a + 3];
+            }
+
+            int smem_col_a = row_a;
+            int smem_row_a_base = vec_a * 4;
+            As[smem_row_a_base + 0][smem_col_a] = val_a.x;
+            As[smem_row_a_base + 1][smem_col_a] = val_a.y;
+            As[smem_row_a_base + 2][smem_col_a] = val_a.z;
+            As[smem_row_a_base + 3][smem_col_a] = val_a.w;
+
+            int row_b = tid / 32;
+            int col_b_vec = tid % 32;
+            int global_row_b = k0 + row_b;
+            int global_col_b = blockIdx.x * BN + col_b_vec * 4;
+
+            float4 val_b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (global_row_b < n && global_col_b + 3 < n) {
+                val_b = *reinterpret_cast<const float4*>(&B[global_row_b * n + global_col_b]);
+            }
+            else if (global_row_b < n) {
+                if (global_col_b + 0 < n) val_b.x = B[global_row_b * n + global_col_b + 0];
+                if (global_col_b + 1 < n) val_b.y = B[global_row_b * n + global_col_b + 1];
+                if (global_col_b + 2 < n) val_b.z = B[global_row_b * n + global_col_b + 2];
+                if (global_col_b + 3 < n) val_b.w = B[global_row_b * n + global_col_b + 3];
+            }
+
+            reinterpret_cast<float4*>(&Bs[row_b][col_b_vec * 4])[0] = val_b;
+        }
+        else {
+            for (int i=0; i<4; ++i) {
+                int idx = threadIdx.x + i * 256;
+                int row_a = idx / BK;
+                int col_a = idx % BK;
+                int global_row_a = blockIdx.y * BM + row_a;
+                int global_col_a = k0 + col_a;
+                As[col_a][row_a] = (global_row_a < n && global_col_a < n) ? A[global_row_a * n + global_col_a] : 0.0f;
+                int row_b = idx / BN;
+                int col_b = idx % BN;
+                int global_row_b = k0 + row_b;
+                int global_col_b = blockIdx.x * BN + col_b;
+                Bs[row_b][col_b] = (global_row_b < n && global_col_b < n) ? B[global_row_b * n + global_col_b] : 0.0f;
+            }
+        }
+        __syncthreads();
+        // ============== TODO(you) 4c : RESTRUCTURE THIS LOOP ==============
+        // Today every kk iteration is: issue 4 LDS, WAIT for them, then do 64
+        // FFMAs that depend on them. That wait is the 18.87% short_scoreboard.
+        //
+        // Software pipelining breaks the dependency by one iteration:
+        //
+        //   PROLOGUE   load the kk = 0 fragments
+        //   for (kk = 0; kk < BK; ++kk) {
+        //       if (kk + 1 < BK)  issue the loads for kk+1   <-- no wait here
+        //       64 FFMAs using the kk fragments              <-- covers the wait
+        //       the kk+1 fragments become current
+        //   }
+        //
+        // Two ways to hold two generations of fragments:
+        //   (A) float regA[2][TM], regB[2][TN], indexed by (kk & 1).
+        //       REQUIRES the kk loop to be fully unrolled, or (kk & 1) is not a
+        //       compile-time constant and BOTH arrays go to local memory.
+        //       Note 4b has no #pragma unroll on this loop -- nvcc did it for
+        //       you. For 4c, write it explicitly. Do not rely on luck.
+        //   (B) separate cur/next sets with an explicit copy at the end. More
+        //       registers live at once, but no indexing question.
+        //
+        // !! THE REAL CONSTRAINT !! You are at 118 registers and 2 blocks/SM.
+        // sm_86 gives 65536 registers per SM, so 2 blocks x 256 threads caps
+        // you at 65536/(2*256) = 128 registers. Budget: 10.
+        //     double-buffer regA AND regB  -> +16 -> 134 -> 1 block -> 16.7%
+        //     double-buffer only one       -> + 8 -> 126 -> 2 blocks -> 33.3%
+        // Decide which, and predict the outcome, BEFORE you measure. Then run
+        // make resource FIRST -- if registers cross 128 or spill appears, the
+        // occupancy you lose may cost more than the latency you hid.
+        // ==================================================================
+        // Prologue：先載入 kk = 0 的 fragments
+        float regA_cur[TM], regB_cur[TN];
+        #pragma unroll
+        for (int i=0; i<TM; ++i) {
+            regA_cur[i] = As[0][tRow * TM + i];
+        }
+        #pragma unroll
+        for (int j=0; j<4; ++j) {
+            regB_cur[j]     = Bs[0][tCol * 4 + j];
+            regB_cur[j + 4] = Bs[0][BN / 2 + tCol * 4 + j];
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            // 如果還有下一輪，預先發出 kk + 1 的載入（不等待，讓下面的 FFMAs 掩蓋延遲）
+            float regA_next[TM], regB_next[TN];
+            if (kk + 1 < BK) {
+                #pragma unroll
+                for (int i=0; i<TM; ++i) {
+                    regA_next[i] = As[kk + 1][tRow * TM + i];
+                }
+                #pragma unroll
+                for (int j=0; j<4; ++j) {
+                    regB_next[j]     = Bs[kk + 1][tCol * 4 + j];
+                    regB_next[j + 4] = Bs[kk + 1][BN / 2 + tCol * 4 + j];
+                }
+            }
+
+            // 使用當前（cur）的 fragments 進行運算
+            #pragma unroll
+            for (int i=0; i<TM; ++i) {
+                #pragma unroll
+                for (int j=0; j<TN; ++j) {
+                    acc[i][j] += regA_cur[i] * regB_cur[j];
+                }
+            }
+
+            // 將 next 推進成為 cur，準備進入下一輪
+            if (kk + 1 < BK) {
+                #pragma unroll
+                for (int i=0; i<TM; ++i) {
+                    regA_cur[i] = regA_next[i];
+                }
+                #pragma unroll
+                for (int j=0; j<TN; ++j) {
+                    regB_cur[j] = regB_next[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i=0; i<TM; ++i) {
+        for (int j=0; j<TN; ++j) {
+            int global_row = blockIdx.y * BM + tRow * TM + i;
+            int global_col = (j < 4) ? blockIdx.x * BN + tCol * 4 + j : blockIdx.x * BN + BN / 2 + tCol * 4 + (j - 4);
+            if (global_row < n && global_col < n) {
+                C[global_row * n + global_col] = acc[i][j];
+            }
+        }
+    }
+}
+
+// ===========================================================================
+//  Future work : shared-memory ping-pong, wider BK, cp.async (sm_80+)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -493,6 +851,18 @@ static void launch_vec_v1(const float* A, const float* B, float* C, int n) {
     gemm_vec_v1<<<grid, block>>>(A, B, C, n);
 }
 
+static void launch_vec_v2(const float* A, const float* B, float* C, int n) {
+    dim3 block(THREADS_PER_BLOCK);
+    dim3 grid(ceil_div(n, BN), ceil_div(n, BM));
+    gemm_vec_v2<<<grid, block>>>(A, B, C, n);
+}
+
+static void launch_db_v1(const float* A, const float* B, float* C, int n) {
+    dim3 block(THREADS_PER_BLOCK);
+    dim3 grid(ceil_div(n, BN), ceil_div(n, BM));
+    gemm_db_v1<<<grid, block>>>(A, B, C, n);
+}
+
 #ifdef USE_CUBLAS
 static cublasHandle_t g_cublas = nullptr;
 static void launch_cublas(const float* A, const float* B, float* C, int n) {
@@ -515,6 +885,8 @@ static const KernelEntry g_kernels[] = {
     { "3. tiled  (shared memory)",               launch_tiled_v1 },
     { "4. regtile (128x128 blk, 8x8/thread)",    launch_regtile_v1 },
     { "5. vec     (As^T + float4 smem loads)",   launch_vec_v1     },
+    { "6. vec2    (+ split regB, no conflicts)",  launch_vec_v2     },
+    { "7. db      (+ register double buffering)", launch_db_v1      },
 #ifdef USE_CUBLAS
     { "0. cuBLAS SGEMM           [reference]",   launch_cublas   },
 #endif
