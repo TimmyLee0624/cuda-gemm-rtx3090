@@ -14,7 +14,7 @@ Toolchain  CUDA 12.9, nvcc -O3 -arch=sm_86 -lineinfo
 
 ## Results
 
-All figures at `N = 4096`, single kernel launch averaged over 5 iterations.
+All figures at `N = 4096`: two untimed warm-up launches, then five launches timed as a group and averaged.
 
 | # | Kernel | Time (ms) | GFLOP/s | % peak | % cuBLAS | Optimization target |
 |---|--------|----------:|--------:|-------:|---------:|---|
@@ -33,8 +33,27 @@ The profiling results motivate further investigation of global-memory latency an
 
 The main results table and the individual controlled experiments below report separate measurements; their throughput values are retained as recorded.
 
-Correctness is checked at `N = 1024` and `N = 1000` (deliberately not a
-multiple of the tile size) against a double-precision CPU reference.
+Correctness is verified against a double-precision CPU reference at:
+
+| N | Property exercised |
+|---|---|
+| 1024 | multiple of both the 128-wide block tile and the `float4` vector width |
+| 1000, 200 | not multiples of the block tile — exercises the zero-filled boundary path |
+| 127, 201, 1021 | **not multiples of 4** — the vectorized kernels take their scalar fallback, since `reinterpret_cast<float4*>` cannot serve a row pitch that is not 16-byte aligned |
+
+All seven kernels pass at every size above. The distinction in the last row
+matters: `N = 1000` and `N = 200` are not tile multiples but *are* divisible by
+four, so they still take the vectorized path. Only the odd sizes reach the
+scalar fallback.
+
+`compute-sanitizer` reports zero memory errors (`--tool memcheck`) and zero
+hazards (`--tool racecheck`) for all seven kernels at `N = 127` and `N = 200`.
+With the cuBLAS reference compiled in, memcheck additionally reports one
+`CUDA_ERROR_INVALID_VALUE` on a `cuCtxGetLimit` call whose host backtrace lies
+inside `cublasLtCtxInit` / `cublasCreate_v2`. The same binary built without
+cuBLAS reports zero errors on the same workload, which places the report in the
+cuBLAS initialization path rather than in any kernel here; its significance
+within cuBLAS has not been investigated further.
 
 ## Build & run
 
@@ -45,6 +64,14 @@ make run N=1024           # N <= 1024 also runs CPU verification
 make resource             # per-kernel register / shared-mem / spill report
 make bank KERNEL=gemm_vec_v1 ID=5    # shared-memory bank-conflict counters
 ```
+
+`make bank` invokes Nsight Compute, which reads GPU performance counters. Many
+Linux installations restrict that to administrators, in which case the run fails
+with `ERR_NVGPUCTRPERM`. If your system already permits counter access, nothing
+extra is needed. If it does not, either pass `NCU_SUDO=1` to run that single
+command under `sudo`, or set `NVreg_RestrictProfilingToAdminUsers=0` in a
+`modprobe.d` file and reboot, after which no elevation is required. The build
+and benchmark targets never need elevated privileges.
 
 ## Method
 
@@ -60,6 +87,37 @@ Instead, we use a double-precision CPU reference and two error metrics:
 - **Backward-error indicator:** `max|error| / (N · ε · max|A| · max|B|)`, where ε is the FP32 machine epsilon.
 
 The normwise relative error provides a matrix-level correctness criterion without being dominated by individual near-zero reference values. The backward-error indicator normalizes the observed error by an estimated floating-point error scale that accounts for the dot-product length, numerical precision, and input magnitudes. Healthy kernels exhibit values of O(1) or smaller, whereas a genuinely broken kernel produced a value of approximately 5 × 10⁵, far beyond the expected rounding-error scale.
+
+### cuBLAS baseline precision
+
+The cuBLAS comparison is same-precision FP32. Four independent levels of
+evidence support this, in increasing strength:
+
+1. **API semantics.** The baseline calls `cublasSgemm` with `float` inputs, a
+   `float` output, and `float` alpha and beta. The API contract is FP32
+   throughout.
+2. **Configured math mode.** This project never calls `cublasSetMathMode`.
+   Querying a freshly created handle under cuBLAS 12.9.1 returns
+   `CUBLAS_DEFAULT_MATH`, not `CUBLAS_TF32_TENSOR_OP_MATH`.
+3. **Numerical accuracy.** The measured normwise relative error is 3.8e-07 at
+   N = 1024, roughly three times the FP32 machine epsilon of 1.19e-07. TF32
+   carries ten fraction bits, giving an epsilon near 4.9e-04, so a TF32
+   accumulation would show an error about three orders of magnitude larger.
+   This is consistent with FP32, but on its own it does not identify the
+   executed instruction path.
+4. **Executed instruction path.** Nsight Compute reports the selected kernel as
+   `cutlass_80_simt_sgemm_256x128_8x4_nn_align1` — a SIMT, not a tensor-op,
+   kernel — executing `sm__inst_executed_pipe_tensor = 0` instructions with
+   `sm__pipe_tensor_cycles_active = 0%`, while issuing 2.15e9 warp-level FMA
+   instructions, within 0.4% of the N³/32 that a scalar FP32 GEMM requires.
+
+A control experiment forcing `NVIDIA_TF32_OVERRIDE=0` was **inconclusive**: the
+resulting throughput range overlapped the default entirely, so run-to-run clock
+variation dominates any math-mode effect at this scale.
+
+Level 4 is specific to this device, driver, cuBLAS version and problem shape.
+cuBLAS selects kernels heuristically, so a different configuration could select
+a different kernel; the claim here is about the configuration measured.
 
 ## Stage 1 — Naive baseline
 
